@@ -1,6 +1,6 @@
 import { Canvas, useFrame } from '@react-three/fiber'
 import { PerspectiveCamera, Text } from '@react-three/drei'
-import { Suspense, useRef, useState, useCallback, useEffect } from 'react'
+import { Suspense, useRef, useState, useCallback, useEffect, useMemo } from 'react'
 import * as THREE from 'three'
 
 const RUNWAY_WIDTH = 6
@@ -23,6 +23,15 @@ interface Obstacle {
   lane: number
   z: number
   color: ColorKey
+}
+
+interface Particle {
+  id: number
+  position: THREE.Vector3
+  velocity: THREE.Vector3
+  color: string
+  life: number
+  maxLife: number
 }
 
 function LaneDashedLines({ offset }: { offset: number }) {
@@ -94,17 +103,52 @@ function ObstacleMesh({ obstacle }: { obstacle: Obstacle }) {
   )
 }
 
-function ScoreDisplay({ score, gameOver }: { score: number; gameOver: boolean }) {
+function ParticleSystem({ particles }: { particles: Particle[] }) {
+  const meshRef = useRef<THREE.InstancedMesh>(null)
+  const dummy = useMemo(() => new THREE.Object3D(), [])
+
+  useFrame(() => {
+    if (!meshRef.current) return
+    particles.forEach((particle, i) => {
+      dummy.position.copy(particle.position)
+      const scale = particle.life / particle.maxLife
+      dummy.scale.setScalar(scale * 0.15)
+      dummy.updateMatrix()
+      meshRef.current!.setMatrixAt(i, dummy.matrix)
+    })
+    meshRef.current.instanceMatrix.needsUpdate = true
+  })
+
+  if (particles.length === 0) return null
+
+  return (
+    <instancedMesh ref={meshRef} args={[undefined, undefined, particles.length]}>
+      <sphereGeometry args={[1, 8, 8]} />
+      <meshBasicMaterial color="#ffffff" />
+    </instancedMesh>
+  )
+}
+
+function ScoreDisplay({ score, gameOver, speedPercent }: { score: number; gameOver: boolean; speedPercent: number }) {
   return (
     <>
       <Text
-        position={[0, 4, -2]}
-        fontSize={0.8}
+        position={[-1.5, 4.5, -2]}
+        fontSize={0.6}
         color="white"
         anchorX="center"
         anchorY="middle"
       >
         得分: {score}
+      </Text>
+      <Text
+        position={[1.5, 4.5, -2]}
+        fontSize={0.6}
+        color="#ffff00"
+        anchorX="center"
+        anchorY="middle"
+      >
+        速度: +{speedPercent}%
       </Text>
       {gameOver && (
         <Text
@@ -123,6 +167,7 @@ function ScoreDisplay({ score, gameOver }: { score: number; gameOver: boolean })
 
 function Game() {
   const ballRef = useRef<THREE.Mesh>(null)
+  const ballLightRef = useRef<THREE.PointLight>(null)
   const [lane, setLane] = useState(1)
   const colorKeys: ColorKey[] = ['red', 'green', 'blue']
   const [ballColor, setBallColor] = useState<ColorKey>(() => colorKeys[Math.floor(Math.random() * 3)])
@@ -130,16 +175,24 @@ function Game() {
   const [score, setScore] = useState(0)
   const [gameOver, setGameOver] = useState(false)
   const [runwayOffset, setRunwayOffset] = useState(0)
-  const lastObstacleZ = useRef(-10)
+  const [particles, setParticles] = useState<Particle[]>([])
+  const [ballFlash, setBallFlash] = useState(0)
+  const BASE_SPEED = 10
+  const [speedLevel, setSpeedLevel] = useState(0)
+  const [distance, setDistance] = useState(0)
+  const lastObstaclesZ = useRef(-10)
   const obstacleIdCounter = useRef(0)
-  const lastScoreTime = useRef(0)
+  const particleIdCounter = useRef(0)
+  const passedObstacles = useRef<Set<number>>(new Set())
+  const lastSpeedUpDistance = useRef(0)
+  const lastScoreDistance = useRef(0)
 
   const generateObstacle = useCallback(() => {
     const lane = Math.floor(Math.random() * 3)
     const color = colorKeys[Math.floor(Math.random() * 3)]
-    const z = lastObstacleZ.current - 8 - Math.random() * 4
+    const z = lastObstaclesZ.current - 8 - Math.random() * 4
 
-    lastObstacleZ.current = z
+    lastObstaclesZ.current = z
     obstacleIdCounter.current += 1
 
     return {
@@ -148,6 +201,33 @@ function Game() {
       z,
       color,
     }
+  }, [])
+
+  const createExplosion = useCallback((position: THREE.Vector3, color: string) => {
+    const newParticles: Particle[] = []
+    const particleCount = 30
+
+    for (let i = 0; i < particleCount; i++) {
+      particleIdCounter.current += 1
+      const theta = Math.random() * Math.PI * 2
+      const phi = Math.random() * Math.PI
+      const speed = 3 + Math.random() * 4
+
+      newParticles.push({
+        id: particleIdCounter.current,
+        position: position.clone(),
+        velocity: new THREE.Vector3(
+          Math.sin(phi) * Math.cos(theta) * speed,
+          Math.sin(phi) * Math.sin(theta) * speed,
+          Math.cos(phi) * speed
+        ),
+        color,
+        life: 1.0,
+        maxLife: 1.0,
+      })
+    }
+
+    setParticles((prev) => [...prev, ...newParticles])
   }, [])
 
   useEffect(() => {
@@ -176,10 +256,45 @@ function Game() {
   useFrame((state, delta) => {
     if (gameOver) return
 
-    const speed = 10
-    const moveDistance = speed * delta
+    const currentSpeed = BASE_SPEED * (1 + speedLevel * 0.1)
+    const moveDistance = currentSpeed * delta
+    const newDistance = distance + moveDistance
 
+    const displayDistance = newDistance / 2
+    const lastDisplayDistance = lastSpeedUpDistance.current / 2
+
+    if (displayDistance - lastDisplayDistance >= 10 && speedLevel < 20) {
+      setSpeedLevel((prev) => prev + 1)
+      lastSpeedUpDistance.current = newDistance
+    }
+
+    const scoreDelta = Math.floor(displayDistance) - Math.floor(distance / 2)
+    if (scoreDelta > 0) {
+      setScore((prev) => prev + scoreDelta * 10)
+    }
+
+    setDistance(newDistance)
     setRunwayOffset((prev) => prev + moveDistance)
+
+    setParticles((prev) => {
+      return prev
+        .map((p) => ({
+          ...p,
+          position: p.position.clone().add(p.velocity.clone().multiplyScalar(delta)),
+          velocity: p.velocity.clone().multiplyScalar(0.98),
+          life: p.life - delta * 1.5,
+        }))
+        .filter((p) => p.life > 0)
+    })
+
+    if (ballFlash > 0) {
+      setBallFlash((prev) => Math.max(0, prev - delta))
+    }
+
+    if (ballLightRef.current) {
+      const flashIntensity = ballFlash > 0 ? 5 * Math.sin(ballFlash * Math.PI) : 0
+      ballLightRef.current.intensity = flashIntensity
+    }
 
     setObstacles((prev) => {
       let newObstacles = prev.map((obs) => ({
@@ -187,7 +302,27 @@ function Game() {
         z: obs.z + moveDistance,
       }))
 
-      newObstacles = newObstacles.filter((obs) => obs.z < 10)
+      newObstacles.forEach((obs) => {
+        if (
+          obs.lane === lane &&
+          obs.z > -0.3 &&
+          obs.z < 0.3 &&
+          obs.color === ballColor &&
+          !passedObstacles.current.has(obs.id)
+        ) {
+          passedObstacles.current.add(obs.id)
+          const x = (obs.lane - 1) * LANE_WIDTH
+          createExplosion(new THREE.Vector3(x, OBSTACLE_SIZE / 2, obs.z), COLORS[obs.color])
+          setBallFlash(1.0)
+        }
+      })
+
+      newObstacles = newObstacles.filter((obs) => {
+        if (obs.lane === lane && obs.color === ballColor && obs.z > 0.5) {
+          return false
+        }
+        return obs.z < 10
+      })
 
       while (newObstacles.length < 15) {
         newObstacles.push(generateObstacle())
@@ -196,14 +331,9 @@ function Game() {
       return newObstacles
     })
 
-    const now = state.clock.elapsedTime
-    if (now - lastScoreTime.current >= 1) {
-      setScore((prev) => prev + 10)
-      lastScoreTime.current = now
-    }
-
+    const detectionRange = Math.max(0.5, moveDistance + 0.2)
     obstacles.forEach((obs) => {
-      if (obs.lane === lane && obs.z > -0.5 && obs.z < 0.5) {
+      if (obs.lane === lane && obs.z > -detectionRange && obs.z < detectionRange) {
         if (obs.color !== ballColor) {
           setGameOver(true)
         }
@@ -223,15 +353,23 @@ function Game() {
     setScore(0)
     setGameOver(false)
     setRunwayOffset(0)
-    lastObstacleZ.current = -10
+    setParticles([])
+    setBallFlash(0)
+    setSpeedLevel(0)
+    setDistance(0)
+    passedObstacles.current.clear()
+    lastSpeedUpDistance.current = 0
+    lastScoreDistance.current = 0
+    lastObstaclesZ.current = -10
     obstacleIdCounter.current = 0
-    lastScoreTime.current = 0
     const initialObstacles: Obstacle[] = []
     for (let i = 0; i < 15; i++) {
       initialObstacles.push(generateObstacle())
     }
     setObstacles(initialObstacles)
   }
+
+  const ballEmissiveIntensity = ballFlash > 0 ? 2 * Math.sin(ballFlash * Math.PI) : 0
 
   return (
     <>
@@ -241,21 +379,29 @@ function Game() {
         <ObstacleMesh key={obs.id} obstacle={obs} />
       ))}
 
+      <ParticleSystem particles={particles} />
+
       <mesh ref={ballRef} position={[0, BALL_RADIUS, 0]} castShadow>
         <sphereGeometry args={[BALL_RADIUS, 32, 32]} />
-        <meshPhysicalMaterial
+        <meshStandardMaterial
           color={COLORS[ballColor]}
-          metalness={0.1}
-          roughness={0.05}
-          transmission={0.9}
-          thickness={0.5}
-          ior={1.5}
-          clearcoat={1}
-          clearcoatRoughness={0.1}
+          emissive={COLORS[ballColor]}
+          emissiveIntensity={ballEmissiveIntensity}
+          metalness={0.3}
+          roughness={0.4}
         />
       </mesh>
 
-      <ScoreDisplay score={score} gameOver={gameOver} />
+      <pointLight
+        ref={ballLightRef}
+        position={[0, BALL_RADIUS + 0.5, 0]}
+        color={COLORS[ballColor]}
+        intensity={0}
+        distance={5}
+        decay={2}
+      />
+
+      <ScoreDisplay score={score} gameOver={gameOver} speedPercent={speedLevel * 10} />
 
       {gameOver && (
         <group position={[0, 2, -2]}>
