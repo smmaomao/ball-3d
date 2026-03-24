@@ -253,7 +253,7 @@ function Game() {
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [gameOver])
 
-  useFrame((state, delta) => {
+  useFrame((_, delta) => {
     if (gameOver) return
 
     const currentSpeed = BASE_SPEED * (1 + speedLevel * 0.1)
